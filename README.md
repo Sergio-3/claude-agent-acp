@@ -17,6 +17,7 @@ This tool implements an ACP agent by using the official [Claude Agent SDK](https
 - Custom [Slash commands](https://docs.anthropic.com/en/docs/claude-code/slash-commands)
 - Client MCP servers
 - Session-scoped long-running goals through the provider-neutral [goal extension](docs/goal-extension.md)
+- [Remote Control](https://code.claude.com/docs/en/remote-control) (`/remote-control`)
 
 Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
 
