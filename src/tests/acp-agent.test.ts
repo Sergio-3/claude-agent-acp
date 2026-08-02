@@ -34,7 +34,6 @@ import {
   stripLocalCommandMetadata,
   ClaudeAcpAgent,
   claudeCliPath,
-  getAvailableSlashCommands,
   streamEventToAcpNotifications,
   messageIdForGrouping,
   buildConfigOptions,
@@ -84,7 +83,7 @@ import type {
 
 /** Build the replayed `user` message the SDK echoes back for a pushed prompt,
  *  used by mock generators to promote a turn to active. */
-function userEcho(u: any) {
+export function userEcho(u: any) {
   return {
     type: "user",
     message: u.message,
@@ -132,7 +131,7 @@ const cancelledTurnUsage = {
 /** Wrap a mock async generator with the `Query` methods the agent calls outside
  *  of iteration — `close()` (teardown/closeQueryStream), `interrupt()` (cancel),
  *  and `setModel()` — so a bare generator doesn't trip "x is not a function". */
-function wrapQuery(generator: AsyncGenerator<any>) {
+export function wrapQuery(generator: AsyncGenerator<any>) {
   return Object.assign(generator, {
     interrupt: vi.fn(async () => {}),
     close: vi.fn(),
@@ -143,7 +142,7 @@ function wrapQuery(generator: AsyncGenerator<any>) {
 /** The common `Session` mock fields, with per-test overrides spread on top.
  *  Centralizes the boilerplate (usage accumulator, caches, controllers) so a new
  *  Session field is added in one place rather than every inline literal. */
-function mockSessionState(overrides: Record<string, any> = {}) {
+export function mockSessionState(overrides: Record<string, any> = {}) {
   return {
     cancelled: false,
     cwd: "/test",
@@ -12930,131 +12929,5 @@ describe("permission_denied", () => {
     const sent = denials(updates);
     expect(sent).toHaveLength(1);
     expect((sent[0]._meta as any).claudeCode).not.toHaveProperty("parentToolUseId");
-  });
-});
-
-describe("/remote-control command", () => {
-  function createAgentWithCapture() {
-    const updates: string[] = [];
-    const mockClient = {
-      sessionUpdate: async (params: SessionNotification) => {
-        const u = params.update;
-        if (u.sessionUpdate === "agent_message_chunk" && u.content.type === "text") {
-          updates.push(u.content.text);
-        }
-      },
-    } as unknown as AcpClient;
-    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
-    return { agent, updates };
-  }
-
-  function injectSession(agent: ClaudeAcpAgent, sessionId: string, enableRemoteControl: any) {
-    function* empty() {}
-    const gen = Object.assign(empty(), {
-      interrupt: vi.fn(),
-      close: vi.fn(),
-      supportedCommands: vi.fn().mockResolvedValue([]),
-      enableRemoteControl,
-    });
-    agent.sessions[sessionId] = {
-      query: gen as any,
-      input: new Pushable(),
-      cancelled: false,
-      cwd: "/test",
-      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
-      modes: { currentModeId: "default", availableModes: [] },
-      models: { currentModelId: "default", availableModels: [] },
-      modelInfos: [],
-      settingsManager: { dispose: vi.fn() } as any,
-      accumulatedUsage: {
-        inputTokens: 0,
-        outputTokens: 0,
-        cachedReadTokens: 0,
-        cachedWriteTokens: 0,
-      },
-      configOptions: [],
-      agents: [],
-      currentAgent: "default",
-      fastModeEnabled: false,
-      abortController: new AbortController(),
-      emitRawSDKMessages: false,
-      contextWindowSize: 200000,
-      contextWindowAuthoritative: false,
-      providerCacheKey: "default",
-      taskState: new Map(),
-      toolUseCache: {},
-      emittedToolCalls: new Set(),
-      liveBackgroundTasks: new Map(),
-      emittedAssistantText: false,
-      owedTrailingIdles: 0,
-      messageIdToUuid: new Map(),
-    } as any;
-    return agent.sessions[sessionId]!;
-  }
-
-  it("connects, surfaces the session URL, then disconnects on a second invocation", async () => {
-    const { agent, updates } = createAgentWithCapture();
-    const enableRemoteControl = vi
-      .fn()
-      .mockResolvedValueOnce({ session_url: "https://claude.ai/code/session_abc" })
-      .mockResolvedValueOnce(undefined);
-    injectSession(agent, "s1", enableRemoteControl);
-
-    const r1 = await agent.prompt({
-      sessionId: "s1",
-      prompt: [{ type: "text", text: "/remote-control my-session" }],
-    });
-    expect(r1.stopReason).toBe("end_turn");
-    expect(enableRemoteControl).toHaveBeenNthCalledWith(1, true, "my-session");
-    expect(updates.join("\n")).toContain("https://claude.ai/code/session_abc");
-    expect(agent.sessions["s1"]!.remoteControlActive).toBe(true);
-
-    const r2 = await agent.prompt({
-      sessionId: "s1",
-      prompt: [{ type: "text", text: "/rc" }],
-    });
-    expect(r2.stopReason).toBe("end_turn");
-    expect(enableRemoteControl).toHaveBeenNthCalledWith(2, false, undefined);
-    expect(updates.join("\n")).toContain("Remote Control disconnected");
-    expect(agent.sessions["s1"]!.remoteControlActive).toBe(false);
-  });
-
-  it("reports an error when the bridge fails", async () => {
-    const { agent, updates } = createAgentWithCapture();
-    const enableRemoteControl = vi.fn().mockRejectedValue(new Error("Remote Control is disabled"));
-    injectSession(agent, "s1", enableRemoteControl);
-
-    const r = await agent.prompt({
-      sessionId: "s1",
-      prompt: [{ type: "text", text: "/remote-control" }],
-    });
-    expect(r.stopReason).toBe("end_turn");
-    expect(updates.join("\n")).toContain("Remote Control failed: Remote Control is disabled");
-    expect(agent.sessions["s1"]!.remoteControlActive).toBe(false);
-  });
-
-  it("advertises remote-control and rc so clients forward them", () => {
-    const names = getAvailableSlashCommands([]).map((c) => c.name);
-    expect(names).toContain("remote-control");
-    expect(names).toContain("rc");
-  });
-
-  it("does not duplicate remote-control when the SDK already reports it", () => {
-    const names = getAvailableSlashCommands([
-      { name: "remote-control", description: "from sdk" } as any,
-    ]).map((c) => c.name);
-    expect(names.filter((n) => n === "remote-control")).toHaveLength(1);
-  });
-
-  it("explains when the SDK build lacks Remote Control support", async () => {
-    const { agent, updates } = createAgentWithCapture();
-    injectSession(agent, "s1", undefined);
-
-    const r = await agent.prompt({
-      sessionId: "s1",
-      prompt: [{ type: "text", text: "/rc" }],
-    });
-    expect(r.stopReason).toBe("end_turn");
-    expect(updates.join("\n")).toContain("Remote Control isn't available");
   });
 });

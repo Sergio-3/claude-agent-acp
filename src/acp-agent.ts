@@ -555,9 +555,6 @@ type Session = {
   /** Accumulated task list for the session, keyed by task ID. Task IDs are
    *  per-session, so this state must not be shared across sessions. */
   taskState: TaskState;
-  /** Whether a Remote Control bridge is currently active for this session, so
-   *  `/remote-control` toggles connect/disconnect. */
-  remoteControlActive?: boolean;
   /** Last session title we pushed to the client via `session_info_update`.
    *  The SDK auto-generates a title in a background task and persists it to the
    *  session file; we poll it on each turn-end (`session_state_changed: idle`)
@@ -706,6 +703,25 @@ type Session = {
    *  NOT READ YET — recorded now so the mapping exists if/when we wire up
    *  fork/rewind. */
   messageIdToUuid: Map<string, string>;
+  /** uuids of the user messages THIS adapter pushed into the SDK input — both
+   *  `prompt()` turns and `steer()` injections. A plain-text user message whose
+   *  uuid is absent here was typed on another client attached to the same
+   *  session (claude.ai/code or the mobile app over Remote Control), so it has
+   *  never been rendered locally and must be mirrored into the feed rather than
+   *  dropped. Turn matching cannot answer this on its own: a settled turn's late
+   *  echo matches no queued turn either. Grows by one short string per user
+   *  message and is never pruned, like `messageIdToUuid` above — the entries
+   *  stay meaningful for the session's whole life.
+   *
+   *  Optional on purpose: upstream's test fixtures build `Session` literals
+   *  without this field, and making it required means every new fixture
+   *  upstream adds breaks this patch on the next rebase. Both write sites
+   *  create the set on demand and both read sites treat "absent" exactly like
+   *  "empty", so runtime behaviour is unchanged. */
+  ownPushedUuids?: Set<string>;
+  /** Whether a Remote Control bridge is currently active for this session, so
+   *  `/remote-control` toggles connect/disconnect. */
+  remoteControlActive?: boolean;
 };
 
 /** Result of the SDK's `remote_control` control request. The method exists on
@@ -1789,66 +1805,6 @@ export class ClaudeAcpAgent {
     throw new Error("Method not implemented.");
   }
 
-  private async emitAgentText(sessionId: string, text: string): Promise<void> {
-    await this.client.sessionUpdate({
-      sessionId,
-      update: {
-        sessionUpdate: "agent_message_chunk",
-        content: { type: "text", text },
-      },
-    });
-  }
-
-  /** Connect or disconnect a Remote Control bridge for this session, mirroring
-   *  the official VS Code `/remote-control` behavior over ACP: send the
-   *  `remote_control` control request to the Claude binary, then surface the
-   *  returned session URL (or an error) back to the client. */
-  private async toggleRemoteControl(
-    session: Session,
-    sessionId: string,
-    commandText: string,
-  ): Promise<PromptResponse> {
-    const query = session.query as QueryWithRemoteControl;
-    if (typeof query.enableRemoteControl !== "function") {
-      await this.emitAgentText(
-        sessionId,
-        "Remote Control isn't available in this Claude Code version. Upgrade to a build that supports it (claude-agent-sdk 0.3.x or later).",
-      );
-      return { stopReason: "end_turn" };
-    }
-
-    const name = commandText.split(/\s+/).slice(1).join(" ").trim() || undefined;
-    const enabling = !session.remoteControlActive;
-
-    try {
-      const response = await query.enableRemoteControl(enabling, name);
-      if (enabling) {
-        session.remoteControlActive = true;
-        const url = response?.session_url;
-        if (url) {
-          await this.emitAgentText(
-            sessionId,
-            `🔗 Remote Control is active. Continue this session from any device:\n\n${url}\n\nRun /remote-control (or /rc) again to disconnect.`,
-          );
-        } else {
-          await this.emitAgentText(
-            sessionId,
-            "Remote Control was enabled, but no session URL was returned.",
-          );
-        }
-      } else {
-        session.remoteControlActive = false;
-        await this.emitAgentText(sessionId, "Remote Control disconnected.");
-      }
-    } catch (error) {
-      session.remoteControlActive = false;
-      const message = error instanceof Error ? error.message : String(error);
-      await this.emitAgentText(sessionId, `Remote Control failed: ${message}`);
-    }
-
-    return { stopReason: "end_turn" };
-  }
-
   /**
    * `providers/list` — returns the single client-configurable custom gateway
    * provider (`main`). `current` carries only non-secret routing (never headers,
@@ -1983,6 +1939,74 @@ export class ClaudeAcpAgent {
     }
   }
 
+  private async emitAgentText(sessionId: string, text: string): Promise<void> {
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text },
+      },
+    });
+  }
+
+  /** Connect or disconnect a Remote Control bridge for this session, mirroring
+   *  the official VS Code `/remote-control` behavior over ACP: send the
+   *  `remote_control` control request to the Claude binary, then surface the
+   *  returned session URL (or an error) back to the client. */
+  private async toggleRemoteControl(
+    session: Session,
+    sessionId: string,
+    commandText: string,
+  ): Promise<PromptResponse> {
+    const query = session.query as QueryWithRemoteControl;
+    if (typeof query.enableRemoteControl !== "function") {
+      await this.emitAgentText(
+        sessionId,
+        "Remote Control isn't available in this Claude Code version. Upgrade to a build that supports it (claude-agent-sdk 0.3.x or later).",
+      );
+      return { stopReason: "end_turn" };
+    }
+
+    const name = commandText.split(/\s+/).slice(1).join(" ").trim() || undefined;
+    const enabling = !session.remoteControlActive;
+
+    try {
+      const response = await query.enableRemoteControl(enabling, name);
+      if (enabling) {
+        session.remoteControlActive = true;
+        // The stream carries the bridge's turns — a remote message arrives as a
+        // replayed user message, its answer as normal assistant output — but only
+        // if something is draining it. `prompt()` starts the consumer, and this
+        // command returns before reaching it, so enabling a bridge as the very
+        // first thing in a session would otherwise leave every remote turn
+        // sitting in the SDK's buffer until an unrelated prompt happened to start
+        // the consumer.
+        this.ensureConsumer(session, sessionId);
+        const url = response?.session_url;
+        if (url) {
+          await this.emitAgentText(
+            sessionId,
+            `🔗 Remote Control is active. Continue this session from any device:\n\n${url}\n\nRun /remote-control (or /rc) again to disconnect.`,
+          );
+        } else {
+          await this.emitAgentText(
+            sessionId,
+            "Remote Control was enabled, but no session URL was returned.",
+          );
+        }
+      } else {
+        session.remoteControlActive = false;
+        await this.emitAgentText(sessionId, "Remote Control disconnected.");
+      }
+    } catch (error) {
+      session.remoteControlActive = false;
+      const message = error instanceof Error ? error.message : String(error);
+      await this.emitAgentText(sessionId, `Remote Control failed: ${message}`);
+    }
+
+    return { stopReason: "end_turn" };
+  }
+
   async prompt(params: PromptRequest): Promise<PromptResponse> {
     const session = this.sessions[params.sessionId];
     if (!session) {
@@ -1999,11 +2023,14 @@ export class ClaudeAcpAgent {
       await this.publishTaskPlan(params.sessionId, session.taskState);
     }
 
-    // Intercept /remote-control (or /rc) before entering the turn queue.
-    const firstPromptText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
-    const firstCommand = firstPromptText.startsWith("/") ? firstPromptText.split(/\s+/, 1)[0] : "";
+    const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
+
+    // Remote Control toggles are adapter-local: the SDK's `/remote-control` UI is
+    // terminal-only (`local-jsx`), so drive the control request directly instead
+    // of forwarding the command to the model.
+    const firstCommand = firstText.startsWith("/") ? firstText.split(/\s+/, 1)[0] : "";
     if (REMOTE_CONTROL_COMMANDS.has(firstCommand)) {
-      return await this.toggleRemoteControl(session, params.sessionId, firstPromptText);
+      return await this.toggleRemoteControl(session, params.sessionId, firstText);
     }
 
     const userMessage = promptToClaude(params);
@@ -2012,7 +2039,6 @@ export class ClaudeAcpAgent {
 
     // Local-only commands (e.g. `/clear`) return a result without replaying the
     // user message, so the consumer can't promote the turn from the echo.
-    const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
     const isLocalOnlyCommand =
       firstText.startsWith("/") && LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
 
@@ -2034,6 +2060,9 @@ export class ClaudeAcpAgent {
 
     session.turnQueue ??= [];
     session.turnQueue.push(turn);
+    // Recorded before the push so the consumer can never see the echo of a
+    // message we haven't claimed yet and mistake it for a remote client's.
+    (session.ownPushedUuids ??= new Set()).add(promptUuid);
     session.input.push(userMessage);
     this.ensureConsumer(session, params.sessionId);
     await this.publishGoalFromPrompt(params.sessionId, firstText, promptUuid);
@@ -2196,6 +2225,9 @@ export class ClaudeAcpAgent {
       turnInFlight.steeredSettle = turnInFlight.deferredSettle;
       turnInFlight.deferredSettle = undefined;
     }
+    // A steer creates no Turn, so its echo matches no queued turn; claiming the
+    // uuid is what keeps it out of the remote-mirroring path.
+    (session.ownPushedUuids ??= new Set()).add(userMessage.uuid);
     session.input.push(userMessage);
     const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
     await this.publishGoalFromPrompt(sessionId, firstText, steeredUuid);
@@ -4042,7 +4074,17 @@ export class ClaudeAcpAgent {
                   session.activeTurn.steeredEchoes.delete(message.uuid);
                 }
                 // Unrelated replay (e.g. the echo of an already-settled turn).
-                break;
+                // While a Remote Control bridge is attached, a replay whose uuid
+                // we never pushed can instead be another client's input reaching
+                // us for the first time, so it falls through to the mirroring
+                // path below. Outside that window nothing changes, which is what
+                // keeps `session/load`'s history replay from being emitted twice.
+                if (
+                  !session.remoteControlActive ||
+                  session.ownPushedUuids?.has(message.uuid) === true
+                ) {
+                  break;
+                }
               }
             }
 
@@ -4116,7 +4158,21 @@ export class ClaudeAcpAgent {
               this.logger.error(message.message.content);
               break;
             }
-            // Skip these user messages for now, since they seem to just be messages we don't want in the feed
+            // Plain-text user messages are normally either the SDK echoing input
+            // we pushed ourselves (the client already rendered it) or the CLI's own
+            // synthetic bookkeeping, so they stay out of the feed. The exception is
+            // a message this adapter never pushed: it was typed on ANOTHER client
+            // attached to the same session — claude.ai/code or the mobile app while
+            // Remote Control is on. That text was never rendered locally, so
+            // mirroring it is the only way the local feed stays a complete record
+            // of the conversation (the model's replies already flow through the
+            // assistant path). Judged by `ownPushedUuids` rather than turn
+            // matching, since a settled turn's late echo matches no queued turn
+            // either. Origin cannot be used to spot remote input: the bridge
+            // forwards phone keystrokes as `{kind: "human"}`, exactly like local
+            // ones — hence the conservative gate here, which lets human/unattributed
+            // messages through while leaving synthetic ones and non-human origins
+            // (task notifications, peers, channels) dropped as before.
             if (
               message.type === "user" &&
               (typeof message.message.content === "string" ||
@@ -4124,6 +4180,39 @@ export class ClaudeAcpAgent {
                   message.message.content.length === 1 &&
                   message.message.content[0].type === "text"))
             ) {
+              const echoedUuid =
+                "uuid" in message && typeof message.uuid === "string" ? message.uuid : undefined;
+              const fromRemoteClient =
+                session.remoteControlActive === true &&
+                !message.isSynthetic &&
+                !(echoedUuid && session.ownPushedUuids?.has(echoedUuid) === true) &&
+                (message.origin === undefined || message.origin.kind === "human");
+              if (fromRemoteClient) {
+                const firstBlock = Array.isArray(message.message.content)
+                  ? message.message.content[0]
+                  : undefined;
+                const text =
+                  typeof message.message.content === "string"
+                    ? message.message.content
+                    : firstBlock?.type === "text"
+                      ? firstBlock.text
+                      : "";
+                if (text.trim().length > 0) {
+                  const update: SessionNotification["update"] = {
+                    sessionUpdate: "user_message_chunk",
+                    content: { type: "text", text },
+                  };
+                  // Stamped with the remote message's own id so the client renders
+                  // it as a message of its own. Without this it is appended to
+                  // whatever the local user typed most recently, which is
+                  // guaranteed to be the wrong bubble: the CLI does not forward a
+                  // Remote Control turn to its stream-json consumers when it
+                  // happens, only once we next write to the session's input, so
+                  // this chunk always lands inside a LATER local turn.
+                  applyMessageId(update, messageIdForGrouping(message));
+                  await sendUpdate({ sessionId: params.sessionId, update });
+                }
+              }
               break;
             }
             if (message.message.role === "system") {
@@ -6249,6 +6338,7 @@ export class ClaudeAcpAgent {
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
+      ownPushedUuids: new Set(),
     };
 
     return {
