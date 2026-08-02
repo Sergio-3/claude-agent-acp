@@ -84,7 +84,7 @@ import type {
 
 /** Build the replayed `user` message the SDK echoes back for a pushed prompt,
  *  used by mock generators to promote a turn to active. */
-function userEcho(u: any) {
+export function userEcho(u: any) {
   return {
     type: "user",
     message: u.message,
@@ -132,7 +132,7 @@ const cancelledTurnUsage = {
 /** Wrap a mock async generator with the `Query` methods the agent calls outside
  *  of iteration — `close()` (teardown/closeQueryStream), `interrupt()` (cancel),
  *  and `setModel()` — so a bare generator doesn't trip "x is not a function". */
-function wrapQuery(generator: AsyncGenerator<any>) {
+export function wrapQuery(generator: AsyncGenerator<any>) {
   return Object.assign(generator, {
     interrupt: vi.fn(async () => {}),
     close: vi.fn(),
@@ -143,7 +143,7 @@ function wrapQuery(generator: AsyncGenerator<any>) {
 /** The common `Session` mock fields, with per-test overrides spread on top.
  *  Centralizes the boilerplate (usage accumulator, caches, controllers) so a new
  *  Session field is added in one place rather than every inline literal. */
-function mockSessionState(overrides: Record<string, any> = {}) {
+export function mockSessionState(overrides: Record<string, any> = {}) {
   return {
     cancelled: false,
     cwd: "/test",
@@ -5897,6 +5897,11 @@ describe("terminal slash command filtering", () => {
     expect(commandsUpdate).toBeDefined();
     expect(commandsUpdate.availableCommands.map((c: { name: string }) => c.name)).toEqual([
       "compact",
+      // Advertised by this adapter itself (see REMOTE_CONTROL_AVAILABLE_COMMANDS):
+      // the CLI's own `/remote-control` is terminal-only, so it is driven locally
+      // and appended to every advertisement rather than forwarded to the model.
+      "remote-control",
+      "rc",
     ]);
   });
 
