@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.66.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.66.0...v0.66.1) (2026-08-08)
+
+
+### Bug Fixes
+
+* preserve task plans across prompts ([#974](https://github.com/agentclientprotocol/claude-agent-acp/issues/974)) ([1afa940](https://github.com/agentclientprotocol/claude-agent-acp/commit/1afa940a2c8c0f4c610f4f64d30c0961642907b0))
+
 ## [0.66.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.65.0...v0.66.0) (2026-08-07)
 
 
