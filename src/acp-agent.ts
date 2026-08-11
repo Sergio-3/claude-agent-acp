@@ -774,6 +774,24 @@ type Session = {
   /** Whether a Remote Control bridge is currently active for this session, so
    *  `/remote-control` toggles connect/disconnect. */
   remoteControlActive?: boolean;
+  /** Whether a turn whose prompt was already answered "cancelled" can still put
+   *  frames on the stream: the active turn's stragglers, the in-flight cycle of
+   *  a held turn cancel() settles inline, or a queued turn the interrupt
+   *  reports `still_queued` and the SDK runs anyway. Set by cancel() when it
+   *  found any such turn, cleared wherever `cancelled` is (see activateTurn).
+   *
+   *  Its own field because nothing else answers this question. `cancelled`
+   *  says a cancel happened, not whether anything is left over from it;
+   *  `activeTurn` is null the moment the dead turn settles, while its frames
+   *  keep arriving; and the orphan lanes answer "which result belongs to
+   *  whom" — they carry no entry for the held-turn lane at all, and a
+   *  `started` entry is dropped by ANY result while a turn is active (see
+   *  recordResultForOrphanCommands). Read only by the Remote Control mirror
+   *  exception in the consumer's user/assistant case.
+   *
+   *  Optional on purpose, like `ownPushedUuids` above: upstream fixtures build
+   *  `Session` literals without it, and "absent" reads exactly like false. */
+  cancelledTurnMayStillEmit?: boolean;
 };
 
 /** Result of the SDK's `remote_control` control request. The method exists on
@@ -2030,6 +2048,19 @@ export class ClaudeAcpAgent {
       const response = await query.enableRemoteControl(enabling, name);
       if (enabling) {
         session.remoteControlActive = true;
+        // Enabling a bridge is a deliberate switch to another client, and it
+        // creates no turn (this command returns before the turn machinery), so
+        // neither activateTurn nor cancel()'s quiescent-hold skip ever runs to
+        // clear what an earlier cancel recorded — left standing it would drop
+        // every mirrored frame for the rest of the session, which is the whole
+        // feature. Its price is one straggler of a just-cancelled turn slipping
+        // into the feed, against a mirror that is silently dead for good.
+        //
+        // `cancelled` itself deliberately stays: it drives the turn-settlement
+        // lane (the dead turn's result skip, its settle at the trailing idle,
+        // the issue-#825 detector), and clearing it from a command that owns no
+        // turn would push a still-cancelling turn down the wrong lane.
+        session.cancelledTurnMayStillEmit = false;
         // The stream carries the bridge's turns — a remote message arrives as a
         // replayed user message, its answer as normal assistant output — but only
         // if something is draining it. `prompt()` starts the consumer, and this
@@ -2519,6 +2550,9 @@ export class ClaudeAcpAgent {
     const activateTurn = (turn: Turn) => {
       session.activeTurn = turn;
       session.cancelled = false;
+      // Same lifetime as the latch itself: a live turn is now the one output is
+      // attributed to, so nothing is left over from the cancel that set it.
+      session.cancelledTurnMayStillEmit = false;
       session.pendingOrphanResults = 0;
       session.orphanCommands?.clear();
       // Two-phase sweep of registry entries the level signal ended (see
@@ -4433,7 +4467,38 @@ export class ClaudeAcpAgent {
               }
             }
 
-            if (session.cancelled) {
+            // The latch is a TURN concept: it drops the output of a local turn
+            // whose prompt was already answered "cancelled". Whether such a
+            // turn is left over is `cancelledTurnMayStillEmit`'s single job —
+            // `cancelled` says only that a cancel happened, and `activeTurn`
+            // goes null the moment the dead turn settles while its frames keep
+            // coming (the trailing-straggler, held-turn and still_queued lanes
+            // all end up there).
+            //
+            // With nothing left over AND a Remote Control bridge attached, this
+            // frame is taken to be the mirror of a turn another client ran, and
+            // must pass: the CLI hands such a turn to its stream-json consumers
+            // only once we next write to the session's input, and clients cancel
+            // before every prompt (Zed's `run_turn` does), so it practically
+            // always arrives latched — dropping it left the turn's permission
+            // dialogs and tool calls (neither travels this path) on screen with
+            // none of the prose that explains them. A remote turn that lands
+            // while a dead local turn is still outstanding stays dropped: which
+            // side of that race the CLI takes is not observable from here, and
+            // not leaking a cancelled turn's answer outranks completing the
+            // mirror. That costs the phone message typed DURING such a turn —
+            // it is flushed under the record and dropped with it.
+            //
+            // The record covers cancelled turns only, so prose from a
+            // background cycle of a turn that ended normally passes here with a
+            // bridge attached, indistinguishable from the other client's. It
+            // reaches the feed either way (out-of-turn output is what the hold
+            // in settleOrDefer exists to keep inside a turn), so the cost is
+            // its attribution, not a leak.
+            if (
+              session.cancelled &&
+              !(session.remoteControlActive === true && !session.cancelledTurnMayStillEmit)
+            ) {
               break;
             }
 
@@ -4669,6 +4734,18 @@ export class ClaudeAcpAgent {
               content = message.message.content;
             }
 
+            // Prose that only got here through the latch exception above is
+            // another client's answer, not this session's answer to a local
+            // prompt. sendUpdate marks the local delivery stretch as answered
+            // (see `emittedAssistantText`), so restore that record afterwards:
+            // left set, the NEXT local turn looks already answered and loses
+            // its issue-#453 result-text fallback — measurable on
+            // non-streaming backends and cache replays, where the fallback is
+            // the only thing that puts the local answer on screen. Snapshotted
+            // before the loop: cancel() can flip `cancelled` between awaits.
+            const mirroredUnderLatch = session.cancelled;
+            const deliveredBeforeMirror = session.emittedAssistantText;
+
             for (const notification of toAcpNotifications(
               content,
               message.message.role,
@@ -4697,6 +4774,9 @@ export class ClaudeAcpAgent {
               // (e.g. a subagent image) carry the stamped parentToolUseId
               // meta and are excluded there.
               await sendUpdate(notification);
+            }
+            if (mirroredUnderLatch) {
+              session.emittedAssistantText = deliveredBeforeMirror;
             }
             break;
           }
@@ -4882,6 +4962,22 @@ export class ClaudeAcpAgent {
       return;
     }
     session.cancelled = true;
+    // Record whether this cancel leaves output behind (see
+    // Session.cancelledTurnMayStillEmit) — read here, while the queue still
+    // holds every turn the sweep below is about to empty out of it, and the
+    // active turn with it. A cancel that found nothing records nothing: that
+    // is the shape a client produces before every prompt on a quiescent
+    // session, and the one case in which a frame arriving under the latch can
+    // be taken for another client's turn.
+    //
+    // Sticky while the latch is: only activateTurn and the quiescent-hold skip
+    // below clear it, both of which also clear `cancelled`. Overwriting
+    // instead would let the NEXT cancel — pre-prompt, on a session that only
+    // looks quiet because the dead turn already settled — clear the record
+    // while that turn's frames are still arriving.
+    if (session.turnQueue?.some((turn) => !turn.settled)) {
+      session.cancelledTurnMayStillEmit = true;
+    }
     // A priority steer may still be queued in the SDK when cancellation
     // settles its owning turn. Its later echo matches no live turn, and its
     // result must be skipped rather than promoted onto the next prompt.
@@ -5061,6 +5157,10 @@ export class ClaudeAcpAgent {
       session.lastSessionState === "idle"
     ) {
       session.cancelled = false;
+      // Cleared with the latch: this branch is the proof that nothing is left
+      // over — the settled hold sat on a quiet SDK, and the subagents that
+      // outlive it speak for themselves, not for the cancelled turn.
+      session.cancelledTurnMayStillEmit = false;
       return;
     }
 
