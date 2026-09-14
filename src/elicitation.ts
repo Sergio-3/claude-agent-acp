@@ -212,8 +212,9 @@ export function askUserQuestionsToCreateRequest(
     properties[questionCustomFieldKey(index)] = {
       type: "string",
       title: "Other",
-      description:
-        "Type your own answer: added to your selection above, or used instead of it for single-choice questions (optional).",
+      description: question.multiSelect
+        ? "Type your own answer to add to your selection above (optional)."
+        : "Type your own answer instead of choosing an option above (optional).",
       _meta: {
         [CUSTOM_ANSWER_META_KEY]: {
           questionId: questionFieldKey(index),
@@ -244,18 +245,31 @@ export type AskUserQuestionOutcome =
   { action: "answered"; updatedInput: Record<string, unknown> } | { action: "cancel" };
 
 /**
+ * Serialize a multi-select answer the way the CLI's own AskUserQuestion UI
+ * does: comma-joined, with any item that itself contains the separator (or a
+ * double quote) JSON-quoted. The tool's `call()` splits the string back on the
+ * same rule, so a free-text answer like `Redis, not Memcached` stays one item
+ * instead of reading as two more picks.
+ */
+function joinMultiSelectAnswer(items: string[]): string {
+  return items
+    .map((item) => (item.includes(", ") || item.includes('"') ? JSON.stringify(item) : item))
+    .join(", ");
+}
+
+/**
  * Fold an ACP elicitation response into the AskUserQuestion tool's input.
  *
  * Selected labels are read back from the indexed form fields and written into
- * `answers` as a `{ [questionText]: label }` map (comma-joining multi-selects)
- * — the key shape the tool's own `call()` reads. A non-empty per-question
- * custom-answer field (`question_<n>_custom`) replaces the selection of a
- * single-select question, since the user typed their own answer instead of
- * picking one, and joins the selection of a multi-select question, since there
- * the two fields are independent and filling both means both. Decline yields
- * empty answers (the model is told the user skipped rather than the turn
- * aborting); cancel — and any custom/future action we don't understand —
- * aborts the tool call.
+ * `answers` as a `{ [questionText]: label }` map — the key shape the tool's own
+ * `call()` reads — with multi-selects comma-joined in the CLI's own quoted form
+ * (see `joinMultiSelectAnswer`). A non-empty per-question custom-answer field
+ * (`question_<n>_custom`) replaces the selection of a single-select question,
+ * since the user typed their own answer instead of picking one, and joins the
+ * selection of a multi-select question, where the two fields are independent
+ * and filling both means both. Decline yields empty answers (the model is told
+ * the user skipped rather than the turn aborting); cancel — and any
+ * custom/future action we don't understand — aborts the tool call.
  */
 export function applyAskElicitationResponse(
   response: CreateElicitationResponse,
@@ -278,27 +292,25 @@ export function applyAskElicitationResponse(
     const custom = content[questionCustomFieldKey(index)];
     const customText = typeof custom === "string" ? custom.trim() : "";
 
+    const value = content[questionFieldKey(index)];
+    const picks: string[] =
+      value === undefined || value === null
+        ? []
+        : Array.isArray(value)
+          ? value.filter((item) => item !== undefined && item !== null && item !== "").map(String)
+          : [String(value)];
+
     // A single-select question is answered by exactly one thing, so a typed
     // custom answer replaces the pick: the user wrote their own answer instead
-    // of choosing an option.
-    if (customText !== "" && !question.multiSelect) {
-      answers[question.question] = customText;
-      return;
-    }
+    // of choosing an option. A multi-select is additive, and the form offers
+    // the selection and the custom box as independent fields — a user who
+    // fills both means both, so the typed answer joins the checked options.
+    const items =
+      customText === "" ? picks : question.multiSelect ? [...picks, customText] : [customText];
 
-    const value = content[questionFieldKey(index)];
-    const selection =
-      value === undefined || value === null
-        ? ""
-        : Array.isArray(value)
-          ? value.join(", ")
-          : String(value);
-
-    // A multi-select is additive, and the form offers the selection and the
-    // custom box as independent fields — a user who fills both means both, so
-    // the typed answer joins the checked options instead of replacing them.
-    const text =
-      selection === "" ? customText : customText === "" ? selection : `${selection}, ${customText}`;
+    // A single-select normally holds one item; the plain join only matters if a
+    // client hands back an array for it, and then mirrors the old behavior.
+    const text = question.multiSelect ? joinMultiSelectAnswer(items) : items.join(", ");
     if (text === "") {
       return;
     }
